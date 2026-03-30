@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+
+# Environment / Secrets
+.env
+
+# Training data (quá lớn cho git)
+training_data/
+collected_captchas/
+
+# Trained model (file lớn ~45MB, deploy riêng)
+captcha_model.pth
+
+# Labels (chứa data label, rebuild được)
+labels.csv
+
+# Debug images
+debug_images/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
