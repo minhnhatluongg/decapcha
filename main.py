@@ -8,14 +8,18 @@ Docs: http://localhost:8000/docs
 import base64
 import os
 
-from fastapi import FastAPI, HTTPException, Request
+# pyrefly: ignore [missing-import]
+from fastapi import FastAPI, HTTPException, Request, Header, Depends
+# pyrefly: ignore [missing-import]
 from fastapi.responses import JSONResponse, HTMLResponse
+# pyrefly: ignore [missing-import]
 from pydantic import BaseModel
-from starlette.middleware.base import BaseHTTPMiddleware
 
 from ocr_engine import engine
 from collector import save_captcha, get_stats
 import tct_client
+import tcnnt_client
+import keystore
 import config
 
 app = FastAPI(
@@ -25,35 +29,51 @@ app = FastAPI(
 )
 
 
-# ===== API Key Middleware =====
 
-# Paths không cần API key
-PUBLIC_PATHS = {"/health", "/docs", "/openapi.json", "/redoc", "/demo", "/"}
+@app.on_event("startup")
+async def _startup_load_model():
+    """Load CNN model + init DB key ngay khi service start de tranh lag request dau."""
+    mode = "PROD" if os.environ.get("ENV", "").lower() == "prod" else "DEV"
+    print(f"[Startup] CaptchaService starting | Mode={mode} | Port={config.PORT}")
+
+    # Model 6 ký tự (hoadondientu) - cho /captcha/solve, /one/gettext
+    try:
+        result = engine._load_custom_model()
+        print("[Startup] CNN Model 6 ky tu loaded." if result is not None
+              else "[Startup] CNN Model 6 ky tu NOT loaded - dung EasyOCR/Tesseract.")
+    except Exception as e:
+        print(f"[Startup] Error loading CNN model 6 ky tu: {e}")
+
+    # Model 5 ký tự (TCNNT) - warm san cho /tcnnt/lookup
+    try:
+        m5 = engine._load_model5()
+        print("[Startup] CNN Model 5 ky tu (TCNNT) warmed." if m5 is not None
+              else "[Startup] CNN Model 5 ky tu NOT loaded (thieu captcha_model_v6.pth).")
+    except Exception as e:
+        print(f"[Startup] Error loading CNN model 5 ky tu: {e}")
+
+    # Init DB key + dọn log cũ + chạy thread dọn định kỳ
+    try:
+        keystore.init_db()
+        removed = keystore.cleanup_logs(config.LOG_RETENTION_DAYS)
+        print(f"[Startup] Key DB ready | cleaned {removed} old logs (>{config.LOG_RETENTION_DAYS}d)")
+        threading.Thread(target=_log_cleanup_worker, daemon=True).start()
+    except Exception as e:
+        print(f"[Startup] Error init key DB: {e}")
 
 
-class ApiKeyMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        # Dev mode: API_KEY rỗng → bỏ qua auth
-        if not config.API_KEY:
-            return await call_next(request)
+def _log_cleanup_worker():
+    """Thread daemon: dọn log cũ mỗi 6 giờ để DB không phình."""
+    import time as _t
+    while True:
+        _t.sleep(6 * 3600)
+        try:
+            n = keystore.cleanup_logs(config.LOG_RETENTION_DAYS)
+            if n:
+                print(f"[LogCleanup] Removed {n} logs older than {config.LOG_RETENTION_DAYS}d")
+        except Exception as e:
+            print(f"[LogCleanup] Error: {e}")
 
-        # Public paths → không cần key
-        if request.url.path in PUBLIC_PATHS:
-            return await call_next(request)
-
-        # Check API key từ header hoặc query param
-        api_key = request.headers.get("X-API-Key") or request.query_params.get("api_key")
-
-        if api_key != config.API_KEY:
-            return JSONResponse(
-                status_code=401,
-                content={"error": "Invalid or missing API Key", "hint": "Set header X-API-Key"}
-            )
-
-        return await call_next(request)
-
-
-app.add_middleware(ApiKeyMiddleware)
 
 
 # ===== Request/Response Models =====
@@ -122,6 +142,7 @@ async def captcha_solve():
     Endpoint này thay thế hoàn toàn hàm getCapt() trong C#.
     Client chỉ cần gọi 1 API này là có đủ ckey + cvalue để login.
     """
+    import traceback
     try:
         # Bước 1: Lấy CAPTCHA từ TCT
         png_bytes, captcha_key = tct_client.fetch_captcha()
@@ -140,7 +161,363 @@ async def captcha_solve():
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Log day du traceback ra console (vao service.log)
+        tb = traceback.format_exc()
+        print(f"[captcha_solve] EXCEPTION:\n{tb}", flush=True)
+        # Tra ve message co type cua exception de de debug
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e) or repr(e)}")
+
+
+# ===== Auth: API key cho /tcnnt/lookup =====
+
+def _client_ip(request: Request) -> str:
+    """IP thật của client (qua IIS reverse proxy -> X-Forwarded-For)."""
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else ""
+
+
+def require_api_key(x_api_key: str = Header(None), api_key: str = None) -> dict:
+    """Xác thực + trừ 1 lượt. Key truyền qua header `X-API-Key` hoặc query `?api_key=`."""
+    key = x_api_key or api_key
+    if not key:
+        raise HTTPException(401, "Thiếu API key (header X-API-Key hoặc ?api_key=)")
+
+    status, rec = keystore.consume(key)
+    if status == "not_found":
+        raise HTTPException(401, "API key không hợp lệ")
+    if status == "inactive":
+        raise HTTPException(403, "API key đã bị khoá")
+    if status == "quota_exceeded":
+        raise HTTPException(429, f"Hết lượt gọi API (đã dùng {rec['used']}/{rec['quota']})")
+    return rec
+
+
+@app.get("/tcnnt/lookup")
+def tcnnt_lookup(mst: str, request: Request, max_tries: int = 12, delay: float = 1.5,
+                 key: dict = Depends(require_api_key)):
+    """
+    Tra cứu thông tin người nộp thuế từ tracuunnt.gdt.gov.vn theo MST.
+
+    Yêu cầu API key (header `X-API-Key` hoặc `?api_key=`). Mỗi lần gọi trừ 1 lượt.
+    Chỉ cần nhập `mst` -> tự giải captcha 5 ký tự, retry tới khi ra (anti-bot).
+    Endpoint là `def` (không async) -> FastAPI chạy trong threadpool, không block.
+
+    Response:
+      { mst, address, count_Try, found, status, message,
+        results: [{stt, mst, name, address, tax_authority, status}, ...] }
+    """
+    mst = mst.strip()
+    result = tcnnt_client.lookup_mst(mst, max_tries=max_tries, delay=delay)
+    try:
+        keystore.log_call(key["id"], key["name"], mst, result.get("status"),
+                          result.get("count_Try", 0), _client_ip(request))
+    except Exception as e:
+        print(f"[tcnnt_lookup] log error: {e}")
+    return result
+
+
+# ===== Admin: quản lý API key + log (bảo vệ bằng ADMIN_PASSWORD) =====
+
+def require_admin(x_admin_token: str = Header(None)):
+    if not config.ADMIN_PASSWORD:
+        raise HTTPException(503, "Server chưa cấu hình ADMIN_PASSWORD")
+    if x_admin_token != config.ADMIN_PASSWORD:
+        raise HTTPException(401, "Sai mật khẩu admin")
+    return True
+
+
+class KeyCreate(BaseModel):
+    name: str
+    quota: int | None = None     # số lượt; bỏ trống + unlimited=True -> không giới hạn
+    unlimited: bool = False
+    note: str = ""
+
+
+class KeyUpdate(BaseModel):
+    name: str | None = None
+    quota: int | None = None
+    unlimited: bool = False
+    active: bool | None = None
+    note: str | None = None
+
+
+class AdminLogin(BaseModel):
+    password: str
+
+
+@app.post("/admin/login")
+def admin_login(body: AdminLogin):
+    if not config.ADMIN_PASSWORD:
+        raise HTTPException(503, "Server chưa cấu hình ADMIN_PASSWORD")
+    if body.password != config.ADMIN_PASSWORD:
+        raise HTTPException(401, "Sai mật khẩu")
+    return {"ok": True}
+
+
+@app.get("/admin/keys")
+def admin_list_keys(_=Depends(require_admin)):
+    return keystore.list_keys()
+
+
+@app.post("/admin/keys")
+def admin_create_key(body: KeyCreate, _=Depends(require_admin)):
+    quota = None if body.unlimited else body.quota
+    return keystore.create_key(body.name, quota, body.note)
+
+
+@app.post("/admin/keys/{key_id}/update")
+def admin_update_key(key_id: int, body: KeyUpdate, _=Depends(require_admin)):
+    quota_arg = "__keep__"
+    if body.unlimited:
+        quota_arg = None
+    elif body.quota is not None:
+        quota_arg = body.quota
+    keystore.update_key(key_id, name=body.name, quota=quota_arg,
+                        active=body.active, note=body.note)
+    return keystore.get_key_by_id(key_id)
+
+
+@app.post("/admin/keys/{key_id}/reset")
+def admin_reset_key(key_id: int, _=Depends(require_admin)):
+    keystore.reset_used(key_id)
+    return keystore.get_key_by_id(key_id)
+
+
+@app.delete("/admin/keys/{key_id}")
+def admin_delete_key(key_id: int, _=Depends(require_admin)):
+    keystore.delete_key(key_id)
+    return {"ok": True}
+
+
+@app.get("/admin/logs")
+def admin_logs(limit: int = 200, key_id: int | None = None, _=Depends(require_admin)):
+    return keystore.recent_logs(limit=limit, key_id=key_id)
+
+
+@app.get("/admin/lookup")
+def admin_lookup(mst: str, request: Request, max_tries: int = 15, delay: float = 1.5,
+                 _=Depends(require_admin)):
+    """Tra cứu MST trực tiếp cho admin - KHÔNG giới hạn lượt, lấy thẳng từ TCT."""
+    mst = mst.strip()
+    result = tcnnt_client.lookup_mst(mst, max_tries=max_tries, delay=delay)
+    try:
+        keystore.log_call(None, "ADMIN", mst, result.get("status"),
+                          result.get("count_Try", 0), _client_ip(request))
+    except Exception as e:
+        print(f"[admin_lookup] log error: {e}")
+    return result
+
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>API Key Dashboard - CaptchaService</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#0f0f23; color:#e0e0e0; font-family:'Segoe UI',system-ui,sans-serif; padding:24px; }
+  h1 { color:#00d2d3; font-size:1.4rem; margin-bottom:4px; }
+  .sub { color:#636e72; font-size:.85rem; margin-bottom:20px; }
+  .card { background:#16213e; border:1px solid #2d3436; border-radius:12px; padding:20px; margin-bottom:20px; }
+  .card h2 { font-size:1rem; color:#feca57; margin-bottom:14px; font-weight:600; }
+  label { display:block; font-size:.78rem; color:#7f8fa6; margin:8px 0 4px; }
+  input[type=text], input[type=number], input[type=password] {
+    background:#0a0a1a; border:1px solid #2d3436; border-radius:6px; color:#fff;
+    padding:8px 10px; font-size:.9rem; width:100%; max-width:340px; }
+  input:focus { outline:none; border-color:#00d2d3; }
+  .row { display:flex; gap:14px; flex-wrap:wrap; align-items:flex-end; }
+  button { background:#0773c5; color:#fff; border:none; border-radius:6px; padding:8px 16px;
+    font-size:.85rem; font-weight:600; cursor:pointer; }
+  button:hover { background:#0a8af0; }
+  button.danger { background:#d63031; } button.danger:hover { background:#e84141; }
+  button.ghost { background:#2d3436; } button.ghost:hover { background:#3d4446; }
+  button.sm { padding:4px 10px; font-size:.75rem; }
+  table { width:100%; border-collapse:collapse; font-size:.82rem; }
+  th { text-align:left; color:#7f8fa6; font-weight:500; padding:8px; border-bottom:2px solid #2d3436; }
+  td { padding:8px; border-bottom:1px solid #1a1a2e; vertical-align:middle; }
+  .key { font-family:monospace; font-size:.78rem; color:#00d2d3; }
+  .pill { padding:2px 8px; border-radius:10px; font-size:.72rem; font-weight:600; }
+  .on { background:#00b894; color:#053; } .off { background:#636e72; color:#fff; }
+  .unl { color:#feca57; font-weight:700; }
+  .muted { color:#636e72; }
+  #toast { position:fixed; top:16px; right:16px; background:#00b894; color:#fff; padding:10px 18px;
+    border-radius:8px; opacity:0; transition:.3s; z-index:50; }
+  #toast.show { opacity:1; }
+  #login { max-width:360px; margin:60px auto; }
+  .hidden { display:none; }
+  .newkey { background:#0a2a1a; border:1px solid #00b894; padding:10px; border-radius:8px;
+    margin-top:12px; font-family:monospace; word-break:break-all; color:#55efc4; }
+</style>
+</head>
+<body>
+<div id="toast"></div>
+
+<div id="login" class="card">
+  <h1>API Key Dashboard</h1>
+  <p class="sub">Đăng nhập admin để quản lý key tra cứu MST</p>
+  <label>Mật khẩu admin</label>
+  <input type="password" id="pw" onkeydown="if(event.key==='Enter')login()">
+  <div style="margin-top:14px;"><button onclick="login()">Đăng nhập</button></div>
+  <p id="loginErr" class="sub" style="color:#d63031;margin-top:10px;"></p>
+</div>
+
+<div id="app" class="hidden">
+  <div style="display:flex;justify-content:space-between;align-items:center;">
+    <div><h1>API Key Dashboard</h1><p class="sub">Quản lý key + lượt gọi /tcnnt/lookup</p></div>
+    <button class="ghost" onclick="logout()">Đăng xuất</button>
+  </div>
+
+  <div class="card">
+    <h2>🔎 Tra cứu MST trực tiếp (admin)</h2>
+    <p class="sub" style="margin:-8px 0 12px;">Lấy trực tiếp từ Tổng cục Thuế — admin Nhật đẹp trai tra cứu không giới hạn lượt :D</p>
+    <div class="row">
+      <div><label>Mã số thuế</label><input type="text" id="aMst" placeholder="VD: 0312303803" onkeydown="if(event.key==='Enter')adminLookup()"></div>
+      <div><button id="aBtn" onclick="adminLookup()">Tra cứu</button></div>
+    </div>
+    <div id="aResult"></div>
+  </div>
+
+  <div class="card">
+    <h2>+ Tạo key mới</h2>
+    <div class="row">
+      <div><label>Tên / chủ key</label><input type="text" id="nName" placeholder="VD: Cong ty A"></div>
+      <div><label>Số lượt (quota)</label><input type="number" id="nQuota" placeholder="trống = unlimited" min="1"></div>
+      <div><label>Ghi chú</label><input type="text" id="nNote" placeholder="tuỳ chọn"></div>
+      <div><button onclick="createKey()">Tạo key</button></div>
+    </div>
+    <div id="newKeyBox"></div>
+  </div>
+
+  <div class="card">
+    <h2>Danh sách key</h2>
+    <table id="keysTbl"><thead><tr>
+      <th>ID</th><th>Tên</th><th>Key</th><th>Đã dùng / Quota</th><th>Hôm nay</th><th>Trạng thái</th><th>Thao tác</th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+
+  <div class="card">
+    <h2>Log gọi API (tự xoá sau 2 ngày) <button class="ghost sm" onclick="loadLogs()" style="margin-left:8px;">Tải lại</button></h2>
+    <table id="logsTbl"><thead><tr>
+      <th>Thời gian</th><th>Key</th><th>MST</th><th>Kết quả</th><th>count_Try</th><th>IP</th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+</div>
+
+<script>
+let TOKEN = sessionStorage.getItem('adm_tok') || '';
+const $ = s => document.querySelector(s);
+function toast(m, ok=true){ const t=$('#toast'); t.textContent=m; t.style.background=ok?'#00b894':'#d63031';
+  t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1800); }
+async function api(path, opts={}){
+  opts.headers = Object.assign({'Content-Type':'application/json','X-Admin-Token':TOKEN}, opts.headers||{});
+  const r = await fetch(path, opts);
+  if(r.status===401||r.status===503){ logout(); throw new Error('auth'); }
+  if(!r.ok){ const e=await r.json().catch(()=>({detail:r.status})); throw new Error(e.detail||r.status); }
+  return r.status===204?null:r.json();
+}
+async function login(){
+  const pw=$('#pw').value;
+  try{
+    const r=await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+    if(!r.ok){ $('#loginErr').textContent='Sai mật khẩu'; return; }
+    TOKEN=pw; sessionStorage.setItem('adm_tok',pw); showApp();
+  }catch(e){ $('#loginErr').textContent='Lỗi kết nối'; }
+}
+function logout(){ TOKEN=''; sessionStorage.removeItem('adm_tok'); $('#app').classList.add('hidden'); $('#login').classList.remove('hidden'); }
+function showApp(){ $('#login').classList.add('hidden'); $('#app').classList.remove('hidden'); loadKeys(); loadLogs(); }
+
+function fmtQuota(k){ return k.quota===null||k.quota===undefined ? '<span class="unl">∞</span>' : k.quota; }
+async function loadKeys(){
+  const keys=await api('/admin/keys');
+  const tb=$('#keysTbl tbody'); tb.innerHTML='';
+  for(const k of keys){
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${k.id}</td><td>${esc(k.name)||'<span class=muted>—</span>'}<br><span class=muted style="font-size:.72rem">${esc(k.note)}</span></td>
+      <td><span class="key">${k.key}</span> <button class="ghost sm" onclick="copy('${k.key}')">copy</button></td>
+      <td>${k.used} / ${fmtQuota(k)}</td>
+      <td>${k.used_today}</td>
+      <td><span class="pill ${k.active?'on':'off'}">${k.active?'Hoạt động':'Khoá'}</span></td>
+      <td>
+        <button class="ghost sm" onclick="editQuota(${k.id})">Sửa quota</button>
+        <button class="ghost sm" onclick="toggle(${k.id},${k.active?0:1})">${k.active?'Khoá':'Mở'}</button>
+        <button class="ghost sm" onclick="resetUsed(${k.id})">Reset</button>
+        <button class="danger sm" onclick="del(${k.id})">Xoá</button>
+      </td>`;
+    tb.appendChild(tr);
+  }
+}
+async function createKey(){
+  const name=$('#nName').value.trim(); const qv=$('#nQuota').value.trim();
+  if(!name){ toast('Nhập tên key', false); return; }
+  const body={name, note:$('#nNote').value.trim()};
+  if(qv==='') body.unlimited=true; else body.quota=parseInt(qv);
+  const k=await api('/admin/keys',{method:'POST',body:JSON.stringify(body)});
+  $('#newKeyBox').innerHTML=`<div class="newkey">Key mới cho <b>${esc(k.name)}</b>:<br>${k.key}<br>
+    <button class="ghost sm" style="margin-top:6px" onclick="copy('${k.key}')">Copy key</button></div>`;
+  $('#nName').value=''; $('#nQuota').value=''; $('#nNote').value='';
+  toast('Đã tạo key'); loadKeys();
+}
+async function editQuota(id){
+  const v=prompt('Quota mới (số lượt). Để trống = unlimited:');
+  if(v===null) return;
+  const body = v.trim()==='' ? {unlimited:true} : {quota:parseInt(v)};
+  await api('/admin/keys/'+id+'/update',{method:'POST',body:JSON.stringify(body)});
+  toast('Đã cập nhật quota'); loadKeys();
+}
+async function toggle(id,active){ await api('/admin/keys/'+id+'/update',{method:'POST',body:JSON.stringify({active:!!active})}); loadKeys(); }
+async function resetUsed(id){ if(!confirm('Reset lượt đã dùng về 0?'))return; await api('/admin/keys/'+id+'/reset',{method:'POST'}); toast('Đã reset'); loadKeys(); }
+async function del(id){ if(!confirm('Xoá key này? (xoá cả log của key)'))return; await api('/admin/keys/'+id,{method:'DELETE'}); toast('Đã xoá'); loadKeys(); }
+async function loadLogs(){
+  const logs=await api('/admin/logs?limit=200'); const tb=$('#logsTbl tbody'); tb.innerHTML='';
+  for(const l of logs){
+    const tr=document.createElement('tr');
+    const ok=l.status==='ok';
+    tr.innerHTML=`<td class="muted">${l.created_at?.replace('T',' ')}</td><td>${esc(l.key_name)||l.key_id}</td>
+      <td>${esc(l.mst)}</td><td><span class="pill ${ok?'on':'off'}">${l.status}</span></td>
+      <td>${l.count_try??''}</td><td class="muted">${esc(l.ip)}</td>`;
+    tb.appendChild(tr);
+  }
+}
+async function adminLookup(){
+  const mst=$('#aMst').value.trim(); if(!mst){ toast('Nhập MST', false); return; }
+  const btn=$('#aBtn'); btn.disabled=true; btn.textContent='Đang tra...';
+  $('#aResult').innerHTML='<p class="sub" style="margin-top:10px">⏳ Đang giải captcha + retry (anti-bot, có thể vài lần)...</p>';
+  try{
+    const d=await api('/admin/lookup?mst='+encodeURIComponent(mst));
+    renderLookup(d); loadLogs();
+  }catch(e){ $('#aResult').innerHTML='<p class="sub" style="color:#d63031;margin-top:10px">Lỗi: '+esc(e.message)+'</p>'; }
+  finally{ btn.disabled=false; btn.textContent='Tra cứu'; }
+}
+function renderLookup(d){
+  if(!d.found){
+    $('#aResult').innerHTML=`<div class="newkey" style="background:#2a1a0a;border-color:#e17055;color:#fab1a0">
+      Không ra kết quả · count_Try=${d.count_Try} · ${esc(d.status)}<br>${esc(d.message||'')}</div>`;
+    return;
+  }
+  const rows=d.results.map(r=>`<tr><td>${r.stt}</td><td>${esc(r.mst)}</td><td>${esc(r.name)}</td>
+    <td>${esc(r.address)}</td><td>${esc(r.tax_authority)}</td><td>${esc(r.status)}</td></tr>`).join('');
+  $('#aResult').innerHTML=`
+    <div style="margin-top:12px;padding:14px 16px;background:#0a2a1a;border:1px solid #00b894;border-radius:10px">
+      <div class="sub" style="margin:0 0 6px">✅ MST <b style="color:#fff">${esc(d.mst)}</b> · count_Try=<b style="color:#feca57">${d.count_Try}</b> · Địa chỉ chính:</div>
+      <div style="font-size:1.35rem;font-weight:800;color:#55efc4;line-height:1.35">${esc(d.address)}</div>
+    </div>
+    <table style="margin-top:12px"><thead><tr><th>STT</th><th>MST</th><th>Tên NNT</th><th>Địa chỉ</th><th>Cơ quan thuế</th><th>Trạng thái</th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+function copy(t){ navigator.clipboard.writeText(t).then(()=>toast('Đã copy key')); }
+function esc(s){ return (s??'').toString().replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+if(TOKEN) showApp();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    return DASHBOARD_HTML
 
 
 @app.get("/stats")
@@ -199,6 +576,59 @@ def _crawl_worker(target: int, delay: float):
     _crawl_status["running"] = False
     print(f"[Crawler] Done! Collected {_crawl_status['collected']} images.")
 
+
+# Biến trạng thái riêng cho crawler TCT 5 số
+_crawl5_status = {"running": False, "collected": 0, "target": 0, "errors": 0}
+
+def _crawl5_worker(target: int, delay: float):
+    global _crawl5_status
+    import requests
+    import time
+    import uuid
+
+    _crawl5_status = {"running": True, "collected": 0, "target": target, "errors": 0}
+
+    for i in range(target):
+        if not _crawl5_status["running"]: break
+
+        try:
+            # Dùng uuid để server không trả về ảnh cũ (cache)
+            url = f"{config.TCNNT_PNG_URL}{uuid.uuid4()}"
+            resp = requests.get(url, timeout=10, verify=False)
+            resp.raise_for_status()
+
+            # Lưu vào folder training_data_5
+            # Tên file tạm thời đặt theo timestamp để không trùng
+            filename = f"raw_{int(time.time()*1000)}.png"
+            filepath = os.path.join(config.TRAINING_DATA_5, filename)
+            
+            with open(filepath, "wb") as f:
+                f.write(resp.content)
+
+            _crawl5_status["collected"] += 1
+        except Exception as e:
+            _crawl5_status["errors"] += 1
+            print(f"[Crawl5] Error: {e}")
+
+        time.sleep(delay)
+
+    _crawl5_status["running"] = False
+
+@app.post("/crawler/tcnnt/start")
+async def crawler_tcnnt_start(target: int = 1000, delay: float = 0.5):
+    """Bắt đầu cào ảnh 5 số về folder training_data_5."""
+    global _crawl_task
+    if _crawl5_status["running"]:
+        return {"error": "Crawler đang chạy", "status": _crawl5_status}
+
+    task = threading.Thread(target=_crawl5_worker, args=(target, delay), daemon=True)
+    task.start()
+    return {"message": f"Started crawling {target} images to training_data_5"}
+
+@app.get("/crawler/tcnnt/status")
+async def crawler_tcnnt_status():
+    """Xem tiến độ cào."""
+    return _crawl5_status
 
 @app.post("/crawler/start")
 async def crawler_start(target: int = 2000, delay: float = 1.0):
@@ -361,8 +791,12 @@ async def train_status():
 
 @app.get("/health")
 async def health():
+    # Force load model neu chua load (lazy load fallback)
+    if not engine._custom_model_loaded:
+        engine._load_custom_model()
     model_info = "CNN Model" if engine._custom_model else "EasyOCR + Tesseract"
     return {"status": "ok", "engine": model_info}
+
 
 
 @app.get("/debug/captcha")
@@ -387,8 +821,6 @@ async def debug_captcha():
 
 # ===== Demo UI =====
 
-from fastapi.responses import HTMLResponse
-
 DEMO_HTML = """<!DOCTYPE html>
 <html lang="vi">
 <head>
@@ -402,7 +834,7 @@ DEMO_HTML = """<!DOCTYPE html>
     min-height: 100vh;
   }
   h1 { color: #00d2d3; margin-bottom: 8px; font-size: 1.6rem; }
-  .subtitle { color: #636e72; margin-bottom: 30px; font-size: 0.9rem; }
+  .subtitle { color: #636e72; margin-bottom: 20px; font-size: 0.9rem; }
   .card {
     background: #16213e; border: 2px solid #2d3436; border-radius: 16px;
     padding: 30px; width: 100%; max-width: 700px; text-align: center;
@@ -531,6 +963,7 @@ let totalCorrect = 0;
 let feedbackCount = 0;
 
 function setStatus(msg) { document.getElementById('status').textContent = msg; }
+
 
 function showToast(msg, color) {
   const t = document.getElementById('toast');
@@ -727,10 +1160,57 @@ async def demo_page():
     """Demo UI: Load CAPTCHA từ TCT → Detect bằng CNN Model."""
     return DEMO_HTML
 
+@app.get("/debug/captcha5")
+async def debug_captcha5():
+    """Debug: Lấy CAPTCHA 5 số từ TCNNT dạng PNG trực tiếp."""
+    import uuid
+    import requests as req
 
+    url = f"{config.TCNNT_PNG_URL}{uuid.uuid4()}"
+    resp = req.get(url, timeout=10, verify=False)
+    resp.raise_for_status()
+
+    png_b64 = base64.b64encode(resp.content).decode()
+    return {
+        "key": str(uuid.uuid4()),   # TCNNT PNG không có key, tạo dummy
+        "png_base64": png_b64,
+        "png_preview": f"data:image/png;base64,{png_b64}",
+    }
+
+DEMO1_HTML = DEMO_HTML \
+    .replace(
+        "CAPTCHA Detector Demo",
+        "CAPTCHA Detector Demo - 5 So"
+    ) \
+    .replace(
+        "Load CAPTCHA tu TCT \u2192 Detect bang CNN Model (95.4% accuracy)",
+        "Load CAPTCHA 5 so tu TCNNT \u2192 Detect bang CNN Model (99.1% accuracy)"
+    ) \
+    .replace(
+        "const res = await fetch('/debug/captcha');",
+        "const res = await fetch('/debug/captcha5');"
+    ) \
+    .replace(
+        ".captcha-box img {\n    max-width: 100%; height: auto; border-radius: 8px;\n    image-rendering: auto;\n  }",
+        ".captcha-box img {\n    max-width: 100%; height: auto; border-radius: 8px;\n    image-rendering: auto; background: white; padding: 8px;\n  }"
+    )
+
+@app.get("/demo1", response_class=HTMLResponse)
+async def demo1_page():
+    """Demo UI 5 số: Load CAPTCHA từ TCNNT → Detect bằng CNN Model v6."""
+    return DEMO1_HTML
 # ===== Chạy trực tiếp =====
 
 if __name__ == "__main__":
+    # pyrefly: ignore [missing-import]
     import uvicorn
     import config
-    uvicorn.run("main:app", host=config.HOST, port=config.PORT, reload=True)
+    import os
+    # reload=True chi cho dev. Production set bien moi truong: ENV=prod
+    is_prod = os.environ.get("ENV", "").lower() == "prod"
+    uvicorn.run(
+        "main:app",
+        host=config.HOST,
+        port=config.PORT,
+        reload=not is_prod,
+    )

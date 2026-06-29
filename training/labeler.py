@@ -1,6 +1,6 @@
 """
 CAPTCHA Labeling Tool - Standalone FastAPI app
-Run: python labeler.py
+Run: python training/labeler.py   (từ thư mục gốc project)
 Open: http://localhost:8001
 """
 
@@ -14,9 +14,10 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 import uvicorn
 
-BASE_DIR = Path(__file__).parent
-TRAINING_DIR = BASE_DIR / "training_data"
-LABELS_FILE = BASE_DIR / "labels.csv"
+# Dữ liệu nằm ở thư mục gốc project (cha của training/)
+ROOT = Path(__file__).resolve().parent.parent
+TRAINING_DIR = ROOT / "training_data_5"
+LABELS_FILE = ROOT / "labels_5.csv"
 
 app = FastAPI(title="CAPTCHA Labeler")
 
