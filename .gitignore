@@ -15,19 +15,31 @@ venv/
 
 # Training data (quá lớn cho git)
 training_data/
+training_data_5/
 collected_captchas/
 
-# Trained model (file lớn ~45MB, deploy riêng)
-captcha_model.pth
+# Trained model + ONNX export (file lớn, deploy riêng)
+*.pth
+*.onnx
+*.onnx.data
 
 # Labels (chứa data label, rebuild được)
 labels.csv
+labels_5.csv
+
+# Claude local settings (không commit)
+.claude/settings.local.json
 
 # Debug images
 debug_images/
 
 # Logs
 *.log
+
+# SQLite key/log DB (chứa API key thật - giữ trên server, không commit)
+*.db
+*.db-wal
+*.db-shm
 
 # OS
 .DS_Store

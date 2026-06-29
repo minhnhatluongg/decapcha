@@ -16,19 +16,32 @@ Client (.NET) ──> CaptchaService (Python/FastAPI) ──> TCT CAPTCHA API
 
 ```
 CaptchaService/
-  main.py              # FastAPI server + API endpoints
-  config.py            # Configuration (reads from .env)
-  ocr_engine.py        # OCR engine (CNN model + EasyOCR + Tesseract fallback)
-  captcha_model.py     # CNN model definition (ResNet18 + 6 heads)
-  tct_client.py        # TCT API client (fetch CAPTCHA, authenticate)
-  svg_renderer.py      # SVG to PNG renderer (Playwright subprocess)
-  collector.py         # Save CAPTCHA images for training
-  train.py             # Training script for CNN model
-  labeler.py           # Web UI tool for labeling training images
-  captcha_model.pth    # Trained model weights (not in git, see below)
-  .env                 # Environment config (not in git, see below)
-  .env.example         # Template for .env
-  requirements.txt     # Python dependencies
+  # --- Runtime (production) ---
+  main.py                  # FastAPI server + API endpoints
+  config.py                # Configuration (reads from .env)
+  ocr_engine.py            # OCR engine (CNN model + EasyOCR + Tesseract fallback)
+  captcha_model_resnet6.py # Model def 6 ký tự (ResNet18 + 6 heads) -- ĐANG DÙNG cho /captcha/solve
+  captcha_model_v2.py      # Model def 5 ký tự (ResNet + SE attention)
+  tct_client.py            # TCT API client (fetch CAPTCHA, authenticate)
+  svg_renderer.py          # SVG to PNG renderer (Playwright subprocess)
+  collector.py             # Save CAPTCHA images for training
+  captcha_model.pth        # Weights 6 ký tự (not in git, see below)
+  captcha_model_v6.pth     # Weights 5 ký tự (not in git)
+
+  # --- Dev tooling (không deploy lên prod) ---
+  training/
+    train.py               # Train model 5 ký tự -> captcha_model_v6.pth
+    labeler.py             # Web UI gán nhãn ảnh training
+  tools/
+    check_model.py         # Kiểm tra checkpoint .pth
+    export_to_onnx.py      # Export model 5 ký tự sang ONNX
+    down_version.py        # Hạ ONNX IR version
+  archive/                 # File cũ/không dùng (mini-CNN lỗi thời, onnx experiments)
+
+  # --- Config ---
+  .env                     # Environment config (not in git, see below)
+  .env.example             # Template for .env
+  requirements.txt         # Python dependencies
 ```
 
 ## Quick Start (Development)
@@ -182,7 +195,7 @@ This saves ~3000 CAPTCHA images to `training_data/`.
 ### Step 2: Label images
 
 ```powershell
-python labeler.py
+python training/labeler.py
 ```
 
 Open `http://localhost:8001` in browser. For each image:
@@ -196,10 +209,10 @@ You need at least 1500+ labeled images for decent accuracy.
 ### Step 3: Train
 
 ```powershell
-python train.py
+python training/train.py
 ```
 
-Training takes ~30-60 minutes on CPU. The trained model is saved to `captcha_model.pth`.
+Training takes ~30-60 minutes on CPU. The trained model (5 ký tự) is saved to `captcha_model_v6.pth`.
 
 Expected results:
 - 1500 labeled images: ~90-95% accuracy

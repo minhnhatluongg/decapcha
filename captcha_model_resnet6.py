@@ -1,15 +1,19 @@
 """
 CAPTCHA CNN Model - ResNet18 backbone + 6 classification heads.
+Dùng cho CAPTCHA 6 ký tự từ hoadondientu.gdt.gov.vn
 """
+# pyrefly: ignore [missing-import]
 import torch
+# pyrefly: ignore [missing-import]
 import torch.nn as nn
+# pyrefly: ignore [missing-import]
 import torchvision.models as models
 
 # 36 ký tự: 0-9 + A-Z
 CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 NUM_CHARS = len(CHARS)  # 36
 CAPTCHA_LEN = 6
-IMG_WIDTH = 160
+IMG_WIDTH  = 160   # img_size từ checkpoint: (H=60, W=160)
 IMG_HEIGHT = 60
 
 
@@ -21,11 +25,11 @@ def idx_to_char(i: int) -> str:
     return CHARS[i]
 
 
-def decode_prediction(output: torch.Tensor) -> str:
-    """Decode model output (6 x 36) thành text 6 ký tự."""
+def decode_prediction(outputs: list) -> str:
+    """Decode model output (list of 6 tensors) thành text 6 ký tự."""
     result = ""
     for i in range(CAPTCHA_LEN):
-        idx = output[i].argmax().item()
+        idx = outputs[i].argmax().item()
         result += idx_to_char(idx)
     return result
 
@@ -33,7 +37,7 @@ def decode_prediction(output: torch.Tensor) -> str:
 class CaptchaCNN(nn.Module):
     """
     ResNet18 backbone + 6 heads cho 6 ký tự CAPTCHA.
-    Input: grayscale (1 channel) -> replicate to 3 channels cho ResNet.
+    Input: grayscale (1 channel)
     """
 
     def __init__(self):
@@ -42,20 +46,19 @@ class CaptchaCNN(nn.Module):
         # ResNet18 pre-trained
         resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
 
-        # Sửa conv1: nhận 1 channel thay vì 3
-        # Lấy mean weights từ 3 channels → 1 channel
+        # Sửa conv1: nhận 1 channel (grayscale) thay vì 3 (RGB)
         old_conv = resnet.conv1
         self.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
         with torch.no_grad():
             self.conv1.weight = nn.Parameter(old_conv.weight.mean(dim=1, keepdim=True))
 
-        self.bn1 = resnet.bn1
-        self.relu = resnet.relu
+        self.bn1     = resnet.bn1
+        self.relu    = resnet.relu
         self.maxpool = resnet.maxpool
-        self.layer1 = resnet.layer1
-        self.layer2 = resnet.layer2
-        self.layer3 = resnet.layer3
-        self.layer4 = resnet.layer4
+        self.layer1  = resnet.layer1
+        self.layer2  = resnet.layer2
+        self.layer3  = resnet.layer3
+        self.layer4  = resnet.layer4
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
 
         # ResNet18 output = 512 features
