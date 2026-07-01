@@ -13,6 +13,8 @@ from fastapi import FastAPI, HTTPException, Request, Header, Depends
 # pyrefly: ignore [missing-import]
 from fastapi.responses import JSONResponse, HTMLResponse
 # pyrefly: ignore [missing-import]
+from fastapi.staticfiles import StaticFiles
+# pyrefly: ignore [missing-import]
 from pydantic import BaseModel
 
 from ocr_engine import engine
@@ -27,6 +29,12 @@ app = FastAPI(
     description="API giải CAPTCHA cho WinTax - thay thế TrueCaptcha",
     version="1.0.0",
 )
+
+# Phục vụ thư mục cập nhật app WPF (Velopack) tại https://decapcha.win-tech.vn/app/...
+# Upload nội dung thư mục 'releases' của app WPF vào ./app_releases trên server.
+_APP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_releases")
+os.makedirs(_APP_DIR, exist_ok=True)
+app.mount("/app", StaticFiles(directory=_APP_DIR), name="app_update")
 
 
 
