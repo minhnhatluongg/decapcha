@@ -203,7 +203,7 @@ def require_api_key(x_api_key: str = Header(None), api_key: str = None) -> dict:
 
 
 @app.get("/tcnnt/lookup")
-def tcnnt_lookup(mst: str, request: Request, max_tries: int = 12, delay: float = 1.5,
+def tcnnt_lookup(mst: str, request: Request, max_tries: int = 6, delay: float = 1.5,
                  key: dict = Depends(require_api_key)):
     """
     Tra cứu thông tin người nộp thuế từ tracuunnt.gdt.gov.vn theo MST.
@@ -305,7 +305,7 @@ def admin_logs(limit: int = 200, key_id: int | None = None, _=Depends(require_ad
 
 
 @app.get("/admin/lookup")
-def admin_lookup(mst: str, request: Request, max_tries: int = 15, delay: float = 1.5,
+def admin_lookup(mst: str, request: Request, max_tries: int = 6, delay: float = 1.5,
                  _=Depends(require_admin)):
     """Tra cứu MST trực tiếp cho admin - KHÔNG giới hạn lượt, lấy thẳng từ TCT."""
     mst = mst.strip()

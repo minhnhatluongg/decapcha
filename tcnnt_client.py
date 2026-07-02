@@ -14,6 +14,7 @@ import re
 import html
 import time
 import uuid
+import threading
 import warnings
 
 import requests
@@ -97,6 +98,32 @@ def _classify(page_html: str) -> str:
     return "blocked"   # form trả về nhưng không kết quả, không báo lỗi captcha -> nghi anti-bot
 
 
+# ===== CIRCUIT BREAKER =====
+# Khi TCT chặn IP: sau nhiều lần fail liên tiếp -> NGẮT hẳn (không gọi TCT nữa) trong 1 khoảng,
+# để lưu lượng về ~0 giúp F5 tự gỡ chặn nhanh. Tránh vòng khuếch đại retry giữ block sống mãi.
+_cb_lock = threading.Lock()
+_cb_fail_streak = 0
+_cb_open_until = 0.0
+_CB_FAIL_THRESHOLD = 5     # 5 lần tra fail liên tiếp -> mở mạch
+_CB_COOLDOWN = 120.0       # ngắt 120s: trả lỗi ngay, KHÔNG chạm TCT
+
+
+def _cb_remaining() -> float:
+    return max(0.0, _cb_open_until - time.time())
+
+
+def _cb_record(success: bool) -> None:
+    global _cb_fail_streak, _cb_open_until
+    with _cb_lock:
+        if success:
+            _cb_fail_streak = 0
+            _cb_open_until = 0.0
+        else:
+            _cb_fail_streak += 1
+            if _cb_fail_streak >= _CB_FAIL_THRESHOLD:
+                _cb_open_until = time.time() + _CB_COOLDOWN
+
+
 def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
                min_conf: float = 0.0, timeout: int = 20) -> dict:
     """Tra cứu MST, retry tới khi ra kết quả hoặc hết lượt.
@@ -109,17 +136,26 @@ def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
         return {"mst": mst, "found": False, "count_Try": 0,
                 "status": "error", "message": "MST trống", "results": []}
 
+    # Circuit breaker: nếu đang bị chặn (mạch mở) -> trả lỗi NGAY, KHÔNG chạm TCT
+    rem = _cb_remaining()
+    if rem > 0:
+        return {"mst": mst, "found": False, "count_Try": 0, "status": "circuit_open",
+                "message": f"Tạm ngắt tra cứu {int(rem)}s do TCT đang chặn IP (tự thử lại sau).",
+                "results": []}
+
     session = requests.Session()
     session.headers.update(_BASE_HEADERS)
 
     count_try = 0
     last_status = "init"
+    block_streak = 0   # số lần liên tiếp bị chặn/lỗi mạng -> thoát sớm
 
     # Bước 1: warm-up trang form (lấy cookie + field ẩn)
     try:
         page = session.get(config.TCNNT_LOOKUP_URL, timeout=timeout, verify=False)
         form_fields = _scrape_form_fields(page.text)
     except requests.RequestException as e:
+        _cb_record(False)
         return {"mst": mst, "found": False, "count_Try": 0, "status": "network_error",
                 "message": f"Không tải được trang TCNNT: {type(e).__name__}", "results": []}
 
@@ -153,6 +189,7 @@ def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
             results = parse_results(resp.text)
             if results:
                 primary = next((r for r in results if r["mst"] == mst), results[0])
+                _cb_record(True)
                 return {
                     "mst": mst,
                     "address": primary["address"],
@@ -165,25 +202,39 @@ def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
 
             last_status = _classify(resp.text)
             if last_status == "no_result":
+                _cb_record(True)   # TCT phản hồi bình thường (không phải bị chặn)
                 return {"mst": mst, "address": "", "count_Try": count_try,
                         "found": False, "status": "no_result",
                         "message": "Không tìm thấy NNT với MST này", "results": []}
+            if last_status == "blocked":
+                block_streak += 1
+                if block_streak >= 3:   # bị chặn liên tục -> thoát sớm, đừng dội thêm
+                    break
+            else:
+                block_streak = 0   # captcha_error: TCT vẫn phản hồi -> không tính là chặn
             # captcha_error / blocked -> retry với backoff nhẹ
             time.sleep(delay * (1 + 0.15 * attempt))
 
         except requests.RequestException as e:
             last_status = f"network:{type(e).__name__}"
+            block_streak += 1
+            if block_streak >= 3:
+                break
             time.sleep(delay)
         except Exception as e:
             # Khi TCT chặn, captcha.png trả HTML/lỗi -> solve5 decode ảnh ném exception.
             # Bắt hết để KHÔNG bao giờ ném ra endpoint (tránh lỗi 500), coi như 1 lần thử hỏng.
             last_status = f"error:{type(e).__name__}"
+            block_streak += 1
+            if block_streak >= 3:
+                break
             time.sleep(delay)
 
+    _cb_record(False)
     return {
         "mst": mst, "address": "", "count_Try": count_try, "found": False,
         "status": "exhausted",
-        "message": f"Hết {max_tries} lượt, chưa lấy được (lý do cuối: {last_status}). "
-                   "Có thể bị anti-bot chặn IP - thử lại sau.",
+        "message": f"Chưa lấy được (lý do cuối: {last_status}). "
+                   "Có thể bị anti-bot chặn IP - hệ thống tự lùi, thử lại sau.",
         "results": [],
     }
