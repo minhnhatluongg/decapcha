@@ -98,6 +98,12 @@ def _classify(page_html: str) -> str:
     return "blocked"   # form trả về nhưng không kết quả, không báo lỗi captcha -> nghi anti-bot
 
 
+def _extract_notice(page_html: str) -> str:
+    """Lấy đúng câu thông báo 'Không tìm thấy...' mà TCT trả về (bỏ tag + giải entity)."""
+    m = re.search(r"Không tìm thấy[^.<]*\.?", _text(page_html))
+    return m.group(0).strip() if m else ""
+
+
 # ===== CIRCUIT BREAKER =====
 # Khi TCT chặn IP: sau nhiều lần fail liên tiếp -> NGẮT hẳn (không gọi TCT nữa) trong 1 khoảng,
 # để lưu lượng về ~0 giúp F5 tự gỡ chặn nhanh. Tránh vòng khuếch đại retry giữ block sống mãi.
@@ -203,9 +209,10 @@ def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
             last_status = _classify(resp.text)
             if last_status == "no_result":
                 _cb_record(True)   # TCT phản hồi bình thường (không phải bị chặn)
+                notice = _extract_notice(resp.text) or "Không tìm thấy người nộp thuế nào phù hợp."
                 return {"mst": mst, "address": "", "count_Try": count_try,
                         "found": False, "status": "no_result",
-                        "message": "Không tìm thấy NNT với MST này", "results": []}
+                        "message": notice, "results": []}
             if last_status == "blocked":
                 block_streak += 1
                 if block_streak >= 3:   # bị chặn liên tục -> thoát sớm, đừng dội thêm
