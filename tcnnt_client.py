@@ -174,6 +174,11 @@ def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
         except requests.RequestException as e:
             last_status = f"network:{type(e).__name__}"
             time.sleep(delay)
+        except Exception as e:
+            # Khi TCT chặn, captcha.png trả HTML/lỗi -> solve5 decode ảnh ném exception.
+            # Bắt hết để KHÔNG bao giờ ném ra endpoint (tránh lỗi 500), coi như 1 lần thử hỏng.
+            last_status = f"error:{type(e).__name__}"
+            time.sleep(delay)
 
     return {
         "mst": mst, "address": "", "count_Try": count_try, "found": False,
