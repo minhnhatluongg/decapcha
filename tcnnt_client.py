@@ -7,8 +7,8 @@ Flow (mstdn.jsp):
   3. POST mstdn.jsp  -> {cm, mst, fullname, address, cmt, captcha} cùng Session
   4. Parse bảng HTML kết quả
 
-Lưu ý: Tổng cục Thuế có anti-bot (F5). Captcha có thể bị từ chối vài lần đầu dù
-giải đúng -> retry trong 1 request, có backoff, đếm count_Try.
+Chống anti-bot F5: dùng curl_cffi GIẢ LẬP vân tay TLS của Chrome (impersonate) -> request trông
+như trình duyệt thật nên F5 khó chặn. KHÔNG cần proxy. Vẫn giữ circuit breaker chống dội khi bị chặn.
 """
 import re
 import html
@@ -17,26 +17,21 @@ import uuid
 import threading
 import warnings
 
-import requests
-# pyrefly: ignore [missing-import]
-import urllib3
+# curl_cffi: giả lập TLS/JA3 của Chrome -> né F5 anti-bot (thay cho requests thường)
+from curl_cffi import requests
 
 import config
-import proxy_pool
 from ocr_engine import engine
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=Warning)
 
-# Header giả lập browser thật để giảm khả năng bị anti-bot chặn
+# Vân tay trình duyệt để giả lập. Đổi sang "chrome124"/"chrome131"... nếu cần bản mới hơn.
+_IMPERSONATE = "chrome120"
+
+# Header bổ sung (curl_cffi impersonate đã tự set UA + sec-ch-ua khớp Chrome; đây là header phụ)
 _BASE_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
 
@@ -131,13 +126,11 @@ def _cb_record(success: bool) -> None:
                 _cb_open_until = time.time() + _CB_COOLDOWN
 
 
-def _record_outcome(proxy_key: str, ok: bool) -> None:
-    """Gọi THẲNG (direct) -> dùng circuit breaker của IP server.
-    Qua PROXY -> chỉ cho riêng proxy đó nghỉ/khỏe (không đụng proxy khác)."""
-    if proxy_key == "direct" or not proxy_key:
-        _cb_record(ok)
-    else:
-        proxy_pool.report(proxy_key, ok)
+def _new_session():
+    """Session curl_cffi giả lập Chrome (TLS + header khớp browser thật)."""
+    s = requests.Session(impersonate=_IMPERSONATE)
+    s.headers.update(_BASE_HEADERS)
+    return s
 
 
 def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
@@ -152,21 +145,14 @@ def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
         return {"mst": mst, "found": False, "count_Try": 0,
                 "status": "error", "message": "MST trống", "results": []}
 
-    # Chọn 1 proxy cho CẢ lượt tra (cookie/anti-bot gắn IP -> không đổi IP giữa chừng)
-    proxies, proxy_key = proxy_pool.acquire()
+    # Circuit breaker: nếu đang bị chặn (mạch mở) -> trả lỗi NGAY, KHÔNG chạm TCT
+    rem = _cb_remaining()
+    if rem > 0:
+        return {"mst": mst, "found": False, "count_Try": 0, "status": "circuit_open",
+                "message": f"Tạm ngắt tra cứu {int(rem)}s do TCT đang chặn IP (tự thử lại sau).",
+                "results": []}
 
-    # Circuit breaker CHỈ áp dụng khi gọi THẲNG (không proxy). Qua proxy thì dựa vào sức khỏe từng proxy.
-    if proxy_key == "direct":
-        rem = _cb_remaining()
-        if rem > 0:
-            return {"mst": mst, "found": False, "count_Try": 0, "status": "circuit_open",
-                    "message": f"Tạm ngắt tra cứu {int(rem)}s do TCT đang chặn IP (tự thử lại sau).",
-                    "results": []}
-
-    session = requests.Session()
-    session.headers.update(_BASE_HEADERS)
-    if proxies:
-        session.proxies.update(proxies)   # định tuyến mọi request của lượt này qua proxy
+    session = _new_session()
 
     count_try = 0
     last_status = "init"
@@ -176,8 +162,8 @@ def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
     try:
         page = session.get(config.TCNNT_LOOKUP_URL, timeout=timeout, verify=False)
         form_fields = _scrape_form_fields(page.text)
-    except requests.RequestException as e:
-        _record_outcome(proxy_key, False)
+    except Exception as e:
+        _cb_record(False)
         return {"mst": mst, "found": False, "count_Try": 0, "status": "network_error",
                 "message": f"Không tải được trang TCNNT: {type(e).__name__}", "results": []}
 
@@ -211,7 +197,7 @@ def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
             results = parse_results(resp.text)
             if results:
                 primary = next((r for r in results if r["mst"] == mst), results[0])
-                _record_outcome(proxy_key, True)
+                _cb_record(True)
                 return {
                     "mst": mst,
                     "address": primary["address"],
@@ -224,7 +210,7 @@ def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
 
             last_status = _classify(resp.text)
             if last_status == "no_result":
-                _record_outcome(proxy_key, True)   # TCT phản hồi bình thường (không phải bị chặn)
+                _cb_record(True)   # TCT phản hồi bình thường (không phải bị chặn)
                 notice = _extract_notice(resp.text) or "Không tìm thấy người nộp thuế nào phù hợp."
                 return {"mst": mst, "address": "", "count_Try": count_try,
                         "found": False, "status": "no_result",
@@ -238,22 +224,16 @@ def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
             # captcha_error / blocked -> retry với backoff nhẹ
             time.sleep(delay * (1 + 0.15 * attempt))
 
-        except requests.RequestException as e:
-            last_status = f"network:{type(e).__name__}"
-            block_streak += 1
-            if block_streak >= 3:
-                break
-            time.sleep(delay)
         except Exception as e:
-            # Khi TCT chặn, captcha.png trả HTML/lỗi -> solve5 decode ảnh ném exception.
-            # Bắt hết để KHÔNG bao giờ ném ra endpoint (tránh lỗi 500), coi như 1 lần thử hỏng.
+            # Lỗi mạng HOẶC captcha.png trả HTML-block (solve5 decode ảnh lỗi) -> coi như 1 lần thử hỏng.
+            # Bắt hết để KHÔNG bao giờ ném ra endpoint (tránh lỗi 500).
             last_status = f"error:{type(e).__name__}"
             block_streak += 1
             if block_streak >= 3:
                 break
             time.sleep(delay)
 
-    _record_outcome(proxy_key, False)
+    _cb_record(False)
     return {
         "mst": mst, "address": "", "count_Try": count_try, "found": False,
         "status": "exhausted",

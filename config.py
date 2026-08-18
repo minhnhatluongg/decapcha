@@ -48,11 +48,3 @@ KEYS_DB_PATH = os.environ.get(
 
 # Tự dọn log gọi API cũ hơn số ngày này
 LOG_RETENTION_DAYS = int(os.environ.get("LOG_RETENTION_DAYS", 2))
-
-# ===== Proxy pool (rải request qua nhiều IP để tránh TCT chặn IP server) =====
-# Bật/tắt: USE_PROXY=true|false trong .env  -> tắt là REVERT về gọi thẳng ngay.
-USE_PROXY = os.environ.get("USE_PROXY", "false").strip().lower() in ("1", "true", "yes", "on")
-# File danh sách proxy (mỗi dòng 1 proxy). KHÔNG commit (chứa mật khẩu).
-PROXY_FILE = os.environ.get("PROXY_FILE", os.path.join(os.path.dirname(__file__), "proxies.txt"))
-# 1 proxy bị TCT chặn -> nghỉ bao nhiêu giây trước khi dùng lại
-PROXY_COOLDOWN = int(os.environ.get("PROXY_COOLDOWN", 300))
