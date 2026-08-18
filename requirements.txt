@@ -7,7 +7,7 @@ torchvision==0.19.1
 opencv-python-headless==4.10.0.84
 Pillow==10.4.0
 requests==2.32.3
-curl_cffi==0.7.4
+curl_cffi>=0.7.0
 python-multipart==0.0.9
 numpy==1.26.4
 python-dotenv==1.0.1
