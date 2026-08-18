@@ -41,6 +41,9 @@ debug_images/
 *.db-wal
 *.db-shm
 
+# Danh sách proxy thật (chứa IP + mật khẩu) - giữ trên server, KHÔNG commit
+proxies.txt
+
 # OS
 .DS_Store
 Thumbs.db

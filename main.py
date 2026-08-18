@@ -318,6 +318,26 @@ def admin_lookup(mst: str, request: Request, max_tries: int = 15, delay: float =
     return result
 
 
+@app.get("/admin/proxy")
+def admin_proxy(action: str = "status", _=Depends(require_admin)):
+    """Xem/điều khiển proxy pool (bảo vệ bằng ADMIN token).
+    action:
+      status  -> xem trạng thái (bật/tắt, tổng, khỏe, đang nghỉ)
+      on      -> BẬT proxy ngay (không cần restart)
+      off     -> TẮT proxy ngay = REVERT về gọi thẳng IP server
+      reload  -> nạp lại danh sách từ proxies.txt (sau khi sửa file)
+    """
+    import proxy_pool
+    a = (action or "status").lower()
+    if a == "on":
+        proxy_pool.set_enabled(True)
+    elif a == "off":
+        proxy_pool.set_enabled(False)
+    elif a == "reload":
+        proxy_pool.load()
+    return proxy_pool.status()
+
+
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="vi">
 <head>

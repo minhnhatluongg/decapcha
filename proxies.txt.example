@@ -1,0 +1,14 @@
+# Danh sách proxy — copy file này thành "proxies.txt" rồi điền proxy thật.
+# Mỗi dòng 1 proxy. Dòng bắt đầu bằng # là chú thích, bỏ qua.
+# Hỗ trợ 3 dạng:
+#   http://user:pass@host:port
+#   host:port
+#   host:port:user:pass
+#
+# Nên dùng proxy RESIDENTIAL/MOBILE Việt Nam (khó bị F5 chặn theo dải).
+# Proxy datacenter rẻ nhưng dễ bị chặn cả dải IP.
+
+# Ví dụ:
+# http://user123:pass456@103.100.10.11:8080
+# 103.100.10.22:8080
+# 103.100.10.33:3128:myuser:mypass

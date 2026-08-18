@@ -22,6 +22,7 @@ import requests
 import urllib3
 
 import config
+import proxy_pool
 from ocr_engine import engine
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -130,6 +131,15 @@ def _cb_record(success: bool) -> None:
                 _cb_open_until = time.time() + _CB_COOLDOWN
 
 
+def _record_outcome(proxy_key: str, ok: bool) -> None:
+    """Gọi THẲNG (direct) -> dùng circuit breaker của IP server.
+    Qua PROXY -> chỉ cho riêng proxy đó nghỉ/khỏe (không đụng proxy khác)."""
+    if proxy_key == "direct" or not proxy_key:
+        _cb_record(ok)
+    else:
+        proxy_pool.report(proxy_key, ok)
+
+
 def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
                min_conf: float = 0.0, timeout: int = 20) -> dict:
     """Tra cứu MST, retry tới khi ra kết quả hoặc hết lượt.
@@ -142,15 +152,21 @@ def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
         return {"mst": mst, "found": False, "count_Try": 0,
                 "status": "error", "message": "MST trống", "results": []}
 
-    # Circuit breaker: nếu đang bị chặn (mạch mở) -> trả lỗi NGAY, KHÔNG chạm TCT
-    rem = _cb_remaining()
-    if rem > 0:
-        return {"mst": mst, "found": False, "count_Try": 0, "status": "circuit_open",
-                "message": f"Tạm ngắt tra cứu {int(rem)}s do TCT đang chặn IP (tự thử lại sau).",
-                "results": []}
+    # Chọn 1 proxy cho CẢ lượt tra (cookie/anti-bot gắn IP -> không đổi IP giữa chừng)
+    proxies, proxy_key = proxy_pool.acquire()
+
+    # Circuit breaker CHỈ áp dụng khi gọi THẲNG (không proxy). Qua proxy thì dựa vào sức khỏe từng proxy.
+    if proxy_key == "direct":
+        rem = _cb_remaining()
+        if rem > 0:
+            return {"mst": mst, "found": False, "count_Try": 0, "status": "circuit_open",
+                    "message": f"Tạm ngắt tra cứu {int(rem)}s do TCT đang chặn IP (tự thử lại sau).",
+                    "results": []}
 
     session = requests.Session()
     session.headers.update(_BASE_HEADERS)
+    if proxies:
+        session.proxies.update(proxies)   # định tuyến mọi request của lượt này qua proxy
 
     count_try = 0
     last_status = "init"
@@ -161,7 +177,7 @@ def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
         page = session.get(config.TCNNT_LOOKUP_URL, timeout=timeout, verify=False)
         form_fields = _scrape_form_fields(page.text)
     except requests.RequestException as e:
-        _cb_record(False)
+        _record_outcome(proxy_key, False)
         return {"mst": mst, "found": False, "count_Try": 0, "status": "network_error",
                 "message": f"Không tải được trang TCNNT: {type(e).__name__}", "results": []}
 
@@ -195,7 +211,7 @@ def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
             results = parse_results(resp.text)
             if results:
                 primary = next((r for r in results if r["mst"] == mst), results[0])
-                _cb_record(True)
+                _record_outcome(proxy_key, True)
                 return {
                     "mst": mst,
                     "address": primary["address"],
@@ -208,7 +224,7 @@ def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
 
             last_status = _classify(resp.text)
             if last_status == "no_result":
-                _cb_record(True)   # TCT phản hồi bình thường (không phải bị chặn)
+                _record_outcome(proxy_key, True)   # TCT phản hồi bình thường (không phải bị chặn)
                 notice = _extract_notice(resp.text) or "Không tìm thấy người nộp thuế nào phù hợp."
                 return {"mst": mst, "address": "", "count_Try": count_try,
                         "found": False, "status": "no_result",
@@ -237,7 +253,7 @@ def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
                 break
             time.sleep(delay)
 
-    _cb_record(False)
+    _record_outcome(proxy_key, False)
     return {
         "mst": mst, "address": "", "count_Try": count_try, "found": False,
         "status": "exhausted",
