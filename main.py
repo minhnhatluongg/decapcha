@@ -219,7 +219,10 @@ def tcnnt_lookup(mst: str, request: Request, max_tries: int = 12, delay: float =
     mst = mst.strip()
     result = tcnnt_client.lookup_mst(mst, max_tries=max_tries, delay=delay)
     try:
-        keystore.log_call(key["id"], key["name"], mst, result.get("status"),
+        st = result.get("status")
+        if result.get("cached"):
+            st = f"{st}_cache"   # đánh dấu lấy từ cache (không chạm TCT)
+        keystore.log_call(key["id"], key["name"], mst, st,
                           result.get("count_Try", 0), _client_ip(request))
     except Exception as e:
         print(f"[tcnnt_lookup] log error: {e}")
@@ -311,7 +314,10 @@ def admin_lookup(mst: str, request: Request, max_tries: int = 15, delay: float =
     mst = mst.strip()
     result = tcnnt_client.lookup_mst(mst, max_tries=max_tries, delay=delay)
     try:
-        keystore.log_call(None, "ADMIN", mst, result.get("status"),
+        st = result.get("status")
+        if result.get("cached"):
+            st = f"{st}_cache"
+        keystore.log_call(None, "ADMIN", mst, st,
                           result.get("count_Try", 0), _client_ip(request))
     except Exception as e:
         print(f"[admin_lookup] log error: {e}")

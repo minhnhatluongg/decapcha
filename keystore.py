@@ -58,6 +58,14 @@ def init_db() -> None:
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_logs_created ON call_logs(created_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_logs_key ON call_logs(key_id)")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS mst_cache (
+                mst        TEXT PRIMARY KEY,
+                result     TEXT NOT NULL,       -- JSON kết quả lookup (found/no_result)
+                status     TEXT,
+                updated_at TEXT NOT NULL         -- ISO datetime lúc cache
+            )
+        """)
 
 
 # ===== API key CRUD =====
@@ -183,3 +191,36 @@ def cleanup_logs(days: int) -> int:
     with _lock, _conn() as c:
         cur = c.execute("DELETE FROM call_logs WHERE created_at < ?", (cutoff,))
         return cur.rowcount
+
+
+# ===== Cache MST (giảm gọi TCT) =====
+
+def cache_get(mst: str, ttl_seconds: int):
+    """Trả JSON kết quả đã cache nếu còn hạn (trong ttl_seconds). None nếu không có/hết hạn."""
+    if not mst or ttl_seconds <= 0:
+        return None
+    cutoff = (datetime.now() - timedelta(seconds=ttl_seconds)).isoformat(timespec="seconds")
+    with _conn() as c:
+        r = c.execute(
+            "SELECT result FROM mst_cache WHERE mst=? AND updated_at>=?", (mst, cutoff)
+        ).fetchone()
+    return r["result"] if r else None
+
+
+def cache_put(mst: str, result_json: str, status: str) -> None:
+    """Lưu/ghi đè kết quả cache cho 1 MST."""
+    if not mst:
+        return
+    with _lock, _conn() as c:
+        c.execute(
+            "INSERT INTO mst_cache(mst,result,status,updated_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(mst) DO UPDATE SET result=excluded.result, "
+            "status=excluded.status, updated_at=excluded.updated_at",
+            (mst, result_json, status, _now()),
+        )
+
+
+def cache_stats() -> dict:
+    with _conn() as c:
+        total = c.execute("SELECT COUNT(*) FROM mst_cache").fetchone()[0]
+    return {"cached_mst": total}

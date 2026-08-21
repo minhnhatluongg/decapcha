@@ -12,6 +12,7 @@ như trình duyệt thật nên F5 khó chặn. KHÔNG cần proxy. Vẫn giữ 
 """
 import re
 import html
+import json
 import time
 import uuid
 import threading
@@ -21,6 +22,7 @@ import warnings
 from curl_cffi import requests
 
 import config
+import keystore
 from ocr_engine import engine
 
 warnings.filterwarnings("ignore", category=Warning)
@@ -134,16 +136,30 @@ def _new_session():
 
 
 def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
-               min_conf: float = 0.0, timeout: int = 20) -> dict:
+               min_conf: float = 0.0, timeout: int = 20, use_cache: bool = True) -> dict:
     """Tra cứu MST, retry tới khi ra kết quả hoặc hết lượt.
 
     Returns dict:
       { mst, address, count_Try, found, results[], status, message }
+
+    use_cache=True: cùng 1 MST đã tra thành công trong TTL -> trả cache, KHÔNG chạm TCT.
     """
     mst = (mst or "").strip()
     if not mst:
         return {"mst": mst, "found": False, "count_Try": 0,
                 "status": "error", "message": "MST trống", "results": []}
+
+    # CACHE: MST đã tra thành công gần đây -> trả ngay, KHÔNG gọi TCT
+    if use_cache:
+        cached = keystore.cache_get(mst, config.MST_CACHE_TTL)
+        if cached:
+            try:
+                r = json.loads(cached)
+                r["cached"] = True
+                r["count_Try"] = 0
+                return r
+            except Exception:
+                pass
 
     # Circuit breaker: nếu đang bị chặn (mạch mở) -> trả lỗi NGAY, KHÔNG chạm TCT
     rem = _cb_remaining()
@@ -198,7 +214,7 @@ def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
             if results:
                 primary = next((r for r in results if r["mst"] == mst), results[0])
                 _cb_record(True)
-                return {
+                result = {
                     "mst": mst,
                     "address": primary["address"],
                     "count_Try": count_try,
@@ -207,14 +223,18 @@ def lookup_mst(mst: str, max_tries: int = 12, delay: float = 1.5,
                     "message": f"Thành công sau {count_try} lần giải captcha",
                     "results": results,
                 }
+                keystore.cache_put(mst, json.dumps(result, ensure_ascii=False), "ok")
+                return result
 
             last_status = _classify(resp.text)
             if last_status == "no_result":
                 _cb_record(True)   # TCT phản hồi bình thường (không phải bị chặn)
                 notice = _extract_notice(resp.text) or "Không tìm thấy người nộp thuế nào phù hợp."
-                return {"mst": mst, "address": "", "count_Try": count_try,
-                        "found": False, "status": "no_result",
-                        "message": notice, "results": []}
+                result = {"mst": mst, "address": "", "count_Try": count_try,
+                          "found": False, "status": "no_result",
+                          "message": notice, "results": []}
+                keystore.cache_put(mst, json.dumps(result, ensure_ascii=False), "no_result")
+                return result
             if last_status == "blocked":
                 block_streak += 1
                 if block_streak >= 3:   # bị chặn liên tục -> thoát sớm, đừng dội thêm

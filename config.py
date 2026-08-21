@@ -48,3 +48,7 @@ KEYS_DB_PATH = os.environ.get(
 
 # Tự dọn log gọi API cũ hơn số ngày này
 LOG_RETENTION_DAYS = int(os.environ.get("LOG_RETENTION_DAYS", 2))
+
+# ===== Cache MST (giảm gọi TCT: cùng 1 MST tra lại trong TTL -> trả cache, KHÔNG chạm TCT) =====
+# Thông tin NNT ít đổi -> TTL dài. Mặc định 7 ngày. 0 = tắt cache.
+MST_CACHE_TTL = int(os.environ.get("MST_CACHE_TTL", 7 * 24 * 3600))
