@@ -25,6 +25,17 @@ from pathlib import Path
 import torch
 import config
 
+# CHỐNG TRÀN CPU: mặc định torch chiếm HẾT nhân CPU cho mỗi lần inference. Khi nhiều request
+# captcha chạy song song (product dội + retry) -> CPU 99% -> treo service, phải restart tay.
+# Giới hạn số thread torch (mặc định 1) để mỗi lần giải captcha chỉ dùng 1 nhân -> ổn định.
+_OCR_THREADS = max(1, int(os.environ.get("OCR_THREADS", "1")))
+try:
+    torch.set_num_threads(_OCR_THREADS)
+    torch.set_num_interop_threads(_OCR_THREADS)
+except Exception as _e:
+    print(f"[ocr_engine] set torch threads warning: {_e}")
+print(f"[ocr_engine] torch num_threads = {_OCR_THREADS}")
+
 # Tesseract path trên Windows
 TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 if os.path.exists(TESSERACT_PATH):
